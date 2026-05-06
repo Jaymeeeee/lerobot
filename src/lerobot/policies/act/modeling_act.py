@@ -35,6 +35,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
@@ -90,6 +91,15 @@ class ACTPolicy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
+        self._queues = {}
+        if self.config.n_obs_steps > 1:
+            if self.config.robot_state_feature:
+                self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.image_features:
+                self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.env_state_feature:
+                self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
@@ -104,16 +114,18 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+        batch = self._prepare_inference_batch(batch)
+        batch = self._format_batch_for_model(batch)
 
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
+            actions = self.model(batch)[0]
             action = self.temporal_ensembler.update(actions)
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.model(batch)[0][:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -124,13 +136,37 @@ class ACTPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
+        batch = self._prepare_inference_batch(batch)
+        batch = self._format_batch_for_model(batch)
+        actions = self.model(batch)[0]
+        return actions
+
+    def _prepare_inference_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if ACTION in batch:
+            batch = dict(batch)
+            batch.pop(ACTION)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
 
-        actions = self.model(batch)[0]
-        return actions
+        if self.config.n_obs_steps <= 1:
+            return batch
+
+        self._queues = populate_queues(self._queues, batch)
+        return {key: torch.stack(list(self._queues[key]), dim=1) for key in self._queues if key in batch}
+
+    def _format_batch_for_model(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if OBS_IMAGES not in batch or not isinstance(batch[OBS_IMAGES], torch.Tensor):
+            return batch
+
+        batch = dict(batch)
+        images = batch[OBS_IMAGES]
+        if images.ndim == 6:
+            batch[OBS_IMAGES] = list(torch.unbind(images, dim=2))
+        elif images.ndim == 5:
+            batch[OBS_IMAGES] = list(torch.unbind(images, dim=1))
+        return batch
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -299,7 +335,7 @@ class ACT(nn.Module):
             # Projection layer for joint-space configuration to hidden dimension.
             if self.config.robot_state_feature:
                 self.vae_encoder_robot_state_input_proj = nn.Linear(
-                    self.config.robot_state_feature.shape[0], config.dim_model
+                    self.config.robot_state_feature.shape[0] * config.n_obs_steps, config.dim_model
                 )
             # Projection layer for action (joint-space target) to hidden dimension.
             self.vae_encoder_action_input_proj = nn.Linear(
@@ -338,11 +374,11 @@ class ACT(nn.Module):
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
-                self.config.robot_state_feature.shape[0], config.dim_model
+                self.config.robot_state_feature.shape[0] * config.n_obs_steps, config.dim_model
             )
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
-                self.config.env_state_feature.shape[0], config.dim_model
+                self.config.env_state_feature.shape[0] * config.n_obs_steps, config.dim_model
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
@@ -398,7 +434,15 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        if OBS_IMAGES in batch:
+            batch_size = batch[OBS_IMAGES][0].shape[0]
+            reference_device = batch[OBS_IMAGES][0].device
+        elif self.config.robot_state_feature:
+            batch_size = batch[OBS_STATE].shape[0]
+            reference_device = batch[OBS_STATE].device
+        else:
+            batch_size = batch[OBS_ENV_STATE].shape[0]
+            reference_device = batch[OBS_ENV_STATE].device
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -407,7 +451,9 @@ class ACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(
+                    self._flatten_observation_history(batch[OBS_STATE], OBS_STATE)
+                )
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -427,7 +473,7 @@ class ACT(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=reference_device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -451,7 +497,7 @@ class ACT(nn.Module):
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
             latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
+                reference_device
             )
 
         # Prepare transformer encoder inputs.
@@ -459,23 +505,44 @@ class ACT(nn.Module):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_tokens.append(
+                self.encoder_robot_state_input_proj(self._flatten_observation_history(batch[OBS_STATE], OBS_STATE))
+            )
         # Environment state token.
         if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            encoder_in_tokens.append(
+                self.encoder_env_state_input_proj(
+                    self._flatten_observation_history(batch[OBS_ENV_STATE], OBS_ENV_STATE)
+                )
+            )
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                if img.ndim == 5:
+                    n_obs_steps = img.shape[1]
+                    if n_obs_steps != self.config.n_obs_steps:
+                        raise ValueError(
+                            f"Expected {self.config.n_obs_steps} observation steps for images, got {n_obs_steps}."
+                        )
+                    img = einops.rearrange(img, "b s c h w -> (b s) c h w")
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    # Rearrange features to (sequence, batch, dim), appending all time steps.
+                    cam_features = einops.rearrange(cam_features, "(b s) c h w -> (s h w) b c", b=batch_size)
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "(b s) c h w -> (s h w) b c", b=batch_size)
+                else:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
                 # Extend immediately instead of accumulating and concatenating
                 # Convert to list to extend properly
@@ -507,6 +574,21 @@ class ACT(nn.Module):
         actions = self.action_head(decoder_out)
 
         return actions, (mu, log_sigma_x2)
+
+    def _flatten_observation_history(self, obs: Tensor, name: str) -> Tensor:
+        if obs.ndim == 2:
+            if self.config.n_obs_steps != 1:
+                raise ValueError(
+                    f"Expected {self.config.n_obs_steps} observation steps for {name}, got a single-step tensor."
+                )
+            return obs
+        if obs.ndim != 3:
+            raise ValueError(f"Expected {name} to have shape (B, S, D) or (B, D), got {tuple(obs.shape)}.")
+        if obs.shape[1] != self.config.n_obs_steps:
+            raise ValueError(
+                f"Expected {self.config.n_obs_steps} observation steps for {name}, got {obs.shape[1]}."
+            )
+        return einops.rearrange(obs, "b s d -> b (s d)")
 
 
 class ACTEncoder(nn.Module):
