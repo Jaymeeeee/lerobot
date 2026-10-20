@@ -1,0 +1,11 @@
+RL-Token-Pi05
+Copyright 2026 The RL-Token-Pi05 authors.
+
+Adapted from https://github.com/Zhengsw03/RL-Token-Pi05-open
+Reference commit: cccf949c782266f3dab227ec4265a6360e0511e2
+Original files: lerobot/src/lerobot/policies/pi05_rlt/ and scripts/.
+Licensed under Apache License 2.0; see the repository LICENSE.
+
+This integration adapts the LeRobot interfaces, configurable action/state dimensions,
+training and replay APIs, validation and serialization for AgileX dual Piper.
+LeRobot and Pi0.5 copyright notices remain in their respective source files.

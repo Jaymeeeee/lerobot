@@ -1,0 +1,30 @@
+{
+  "type": "pi05_rlt",
+  "device": "cuda",
+  "dtype": "float32",
+  "mode": "rlt_training",
+  "state_dim": 14,
+  "action_dim": 14,
+  "chunk_size": 50,
+  "max_state_dim": 32,
+  "max_action_dim": 32,
+  "image_resolution": [224, 224],
+  "vlm_hidden_dim": 2048,
+  "rlt_hidden_dim": 2048,
+  "rlt_encoder_layers": 4,
+  "rlt_decoder_layers": 4,
+  "rlt_num_heads": 8,
+  "rlt_dropout": 0.1,
+  "n_action_steps_rl": 10,
+  "action_stride": 2,
+  "policy_fixed_std": 0.05,
+  "discount": 0.99,
+  "bc_weight": 10.0,
+  "target_tau": 0.005,
+  "action_feature_names": [
+    "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4", "left_joint_5", "left_joint_6",
+    "left_gripper_width",
+    "right_joint_1", "right_joint_2", "right_joint_3", "right_joint_4", "right_joint_5", "right_joint_6",
+    "right_gripper_width"
+  ]
+}
