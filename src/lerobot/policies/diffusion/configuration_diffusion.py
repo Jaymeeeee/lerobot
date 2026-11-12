@@ -16,8 +16,9 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
-from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs import NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
+from lerobot.policies.rgbd import rgb_image_features, validate_depth_camera_map
 
 
 @PreTrainedConfig.register_subclass("diffusion")
@@ -104,6 +105,10 @@ class DiffusionConfig(PreTrainedConfig):
     n_obs_steps: int = 2
     horizon: int = 64
     n_action_steps: int = 32
+
+    # Optional metric depth paired with each RGB camera, fused after normalization.
+    depth_camera_map: dict[str, str] = field(default_factory=dict)
+    depth_unit: str = "m"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -226,7 +231,12 @@ class DiffusionConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
         )
 
+    @property
+    def image_features(self) -> dict[str, PolicyFeature]:
+        return rgb_image_features(self.input_features, self.depth_camera_map)
+
     def validate_features(self) -> None:
+        validate_depth_camera_map(self)
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 

@@ -15,8 +15,9 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
-from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs import NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig
+from lerobot.policies.rgbd import rgb_image_features, validate_depth_camera_map
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -51,6 +52,10 @@ class ACTConfig(PreTrainedConfig):
             the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
         output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
             the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
+        depth_camera_map: Optional mapping from each RGB camera key to its paired single-channel depth key.
+            Both inputs are normalized independently, then concatenated into one four-channel view.
+        depth_unit: Physical unit of raw depth inputs and their saved normalization statistics. RGB-D
+            policies require metres ("m").
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
@@ -84,6 +89,8 @@ class ACTConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
+    depth_camera_map: dict[str, str] = field(default_factory=dict)
+    depth_unit: str = "m"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -162,8 +169,14 @@ class ACTConfig(PreTrainedConfig):
         return None
 
     def validate_features(self) -> None:
+        validate_depth_camera_map(self)
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+    @property
+    def image_features(self) -> dict[str, PolicyFeature]:
+        """RGB camera views; paired depth features are fused within each view."""
+        return rgb_image_features(self.input_features, self.depth_camera_map)
 
     @property
     def observation_delta_indices(self) -> None:

@@ -33,6 +33,7 @@ import torchvision
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from lerobot.policies.rgbd import get_camera_tensors, make_rgbd_conv
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
@@ -117,10 +118,13 @@ class DiffusionPolicy(PreTrainedPolicy):
         else:
             batch = dict(batch)
             if self.config.image_features:
-                for key in self.config.image_features:
+                # Video readers can squeeze a one-frame RGB history while
+                # embedded depth retains it; align both modalities before fusion.
+                camera_keys = [*self.config.image_features, *self.config.depth_camera_map.values()]
+                for key in camera_keys:
                     if batch[key].ndim == 4:
                         batch[key] = batch[key].unsqueeze(1)
-                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+                batch[OBS_IMAGES] = torch.stack(get_camera_tensors(self.config, batch), dim=-4)
         actions = self.diffusion.generate_actions(batch, noise=noise)
         return actions
 
@@ -152,7 +156,7 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            batch[OBS_IMAGES] = torch.stack(get_camera_tensors(self.config, batch), dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
@@ -167,10 +171,11 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            for key in self.config.image_features:
+            camera_keys = [*self.config.image_features, *self.config.depth_camera_map.values()]
+            for key in camera_keys:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            batch[OBS_IMAGES] = torch.stack(get_camera_tensors(self.config, batch), dim=-4)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -520,6 +525,8 @@ class DiffusionRgbEncoder(nn.Module):
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
+        if config.depth_camera_map:
+            backbone_model.conv1 = make_rgbd_conv(backbone_model.conv1)
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
@@ -547,7 +554,8 @@ class DiffusionRgbEncoder(nn.Module):
             dummy_shape_h_w = config.resize_shape
         else:
             dummy_shape_h_w = images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+        image_channels = 4 if config.depth_camera_map else images_shape[0]
+        dummy_shape = (1, image_channels, *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)

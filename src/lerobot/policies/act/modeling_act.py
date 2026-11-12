@@ -37,6 +37,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
+from ..rgbd import get_camera_tensors, make_rgbd_conv
 from .configuration_act import ACTConfig
 
 
@@ -132,7 +133,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = get_camera_tensors(self.config, batch)
 
         actions = self.model(batch)[0]
         return actions
@@ -141,7 +142,7 @@ class ACTPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = get_camera_tensors(self.config, batch)
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -337,6 +338,8 @@ class ACT(nn.Module):
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
+            if config.depth_camera_map:
+                backbone_model.conv1 = make_rgbd_conv(backbone_model.conv1)
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
