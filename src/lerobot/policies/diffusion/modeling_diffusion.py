@@ -52,6 +52,7 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_diffusion import DiffusionConfig
+from .modeling_dit import DiffusionConditionalDiT
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -231,12 +232,18 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
-
-        if config.compile_model:
-            # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
-            # common in diffusion inference.
-            self.unet = torch.compile(self.unet, mode=config.compile_mode)
+        conditioning_dim = global_cond_dim * config.n_obs_steps
+        if config.denoiser_type == "unet":
+            # Preserve the original module path and state-dict keys for existing checkpoints.
+            self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=conditioning_dim)
+            if config.compile_model:
+                self.unet = torch.compile(self.unet, mode=config.compile_mode)
+        elif config.denoiser_type == "dit":
+            self.dit = DiffusionConditionalDiT(config, global_cond_dim=conditioning_dim)
+            if config.compile_model:
+                self.dit = torch.compile(self.dit, mode=config.compile_mode)
+        else:
+            raise ValueError(f"`denoiser_type` must be 'unet' or 'dit'. Got {config.denoiser_type!r}.")
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -253,6 +260,15 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+
+    @property
+    def denoiser(self) -> nn.Module:
+        """Selected denoiser without registering a second copy in the state dict."""
+        if self.config.denoiser_type == "unet":
+            return self.unet
+        if self.config.denoiser_type == "dit":
+            return self.dit
+        raise ValueError(f"`denoiser_type` must be 'unet' or 'dit'. Got {self.config.denoiser_type!r}.")
 
     # ========= inference  ============
     def conditional_sample(
@@ -281,7 +297,7 @@ class DiffusionModel(nn.Module):
 
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
-            model_output = self.unet(
+            model_output = self.denoiser(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                 global_cond=global_cond,
@@ -396,7 +412,7 @@ class DiffusionModel(nn.Module):
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        pred = self.denoiser(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.

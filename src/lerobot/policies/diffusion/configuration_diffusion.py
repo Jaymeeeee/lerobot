@@ -14,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PolicyFeature, PreTrainedConfig
@@ -70,24 +71,30 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        denoiser_type: Action denoising backbone: "unet" (default, including legacy checkpoints) or "dit".
+        dit_hidden_dim: Token width of the DiT denoiser, divisible by dit_num_heads.
+        dit_num_layers: Number of DiT blocks with noncausal self-attention and AdaLN-Zero conditioning.
+        dit_num_heads: Number of attention heads per DiT block.
+        dit_mlp_ratio: Ratio of the DiT feed-forward hidden width to dit_hidden_dim.
+        dit_dropout: Dropout probability in the DiT attention and feed-forward blocks.
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
             You may provide a variable number of dimensions, therefore also controlling the degree of
             downsampling.
         kernel_size: The convolutional kernel size of the diffusion modeling Unet.
         n_groups: Number of groups used in the group norm of the Unet's convolutional blocks.
-        diffusion_step_embed_dim: The Unet is conditioned on the diffusion timestep via a small non-linear
-            network. This is the output dimension of that network, i.e., the embedding dimension.
+        diffusion_step_embed_dim: Width of the diffusion timestep embedding. For DiT, the embedding is
+            projected to dit_hidden_dim before conditioning the Transformer blocks.
         use_film_scale_modulation: FiLM (https://huggingface.co/papers/1709.07871) is used for the Unet conditioning.
             Bias modulation is used be default, while this parameter indicates whether to also use scale
             modulation.
-        gradient_checkpointing: Whether to checkpoint the Unet residual blocks during training. This reduces
+        gradient_checkpointing: Whether to checkpoint the denoiser blocks during training. This reduces
             activation memory at the cost of recomputing those blocks during the backward pass.
         noise_scheduler_type: Name of the noise scheduler to use. Supported options: ["DDPM", "DDIM"].
         num_train_timesteps: Number of diffusion steps for the forward diffusion schedule.
         beta_schedule: Name of the diffusion beta schedule as per DDPMScheduler from Hugging Face diffusers.
         beta_start: Beta value for the first forward-diffusion step.
         beta_end: Beta value for the last forward-diffusion step.
-        prediction_type: The type of prediction that the diffusion modeling Unet makes. Choose from "epsilon"
+        prediction_type: The type of prediction that the diffusion denoiser makes. Choose from "epsilon"
             or "sample". These have equivalent outcomes from a latent variable modeling perspective, but
             "epsilon" has been shown to work better in many deep neural network settings.
         clip_sample: Whether to clip the sample to [-`clip_sample_range`, +`clip_sample_range`] for each
@@ -133,13 +140,21 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = True
-    # Unet.
+    # Denoiser. Keep the default and U-Net parameter names for legacy checkpoints.
+    denoiser_type: str = "unet"
+    diffusion_step_embed_dim: int = 128
+    gradient_checkpointing: bool = False
+    # U-Net.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
     n_groups: int = 8
-    diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
-    gradient_checkpointing: bool = False
+    # DiT: one token per action timestep, conditioned on encoded observations.
+    dit_hidden_dim: int = 256
+    dit_num_layers: int = 6
+    dit_num_heads: int = 8
+    dit_mlp_ratio: float = 4.0
+    dit_dropout: float = 0.0
     # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
     num_train_timesteps: int = 100
@@ -172,6 +187,28 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.denoiser_type not in {"unet", "dit"}:
+            raise ValueError(f"`denoiser_type` must be 'unet' or 'dit'. Got {self.denoiser_type!r}.")
+        if self.denoiser_type == "dit":
+            for name in ("dit_hidden_dim", "dit_num_layers", "dit_num_heads", "horizon"):
+                value = getattr(self, name)
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"`{name}` must be a positive integer. Got {value!r}.")
+            if self.dit_hidden_dim % self.dit_num_heads != 0:
+                raise ValueError("`dit_hidden_dim` must be divisible by `dit_num_heads`.")
+            if not math.isfinite(self.dit_mlp_ratio) or self.dit_mlp_ratio <= 0:
+                raise ValueError("`dit_mlp_ratio` must be finite and positive.")
+            if int(self.dit_hidden_dim * self.dit_mlp_ratio) < 1:
+                raise ValueError("`dit_mlp_ratio` must produce at least one hidden unit.")
+            if not 0 <= self.dit_dropout < 1:
+                raise ValueError("`dit_dropout` must be in [0, 1).")
+            if (
+                type(self.diffusion_step_embed_dim) is not int
+                or self.diffusion_step_embed_dim < 4
+                or self.diffusion_step_embed_dim % 2
+            ):
+                raise ValueError("DiT `diffusion_step_embed_dim` must be an even integer >= 4.")
+
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
@@ -211,7 +248,7 @@ class DiffusionConfig(PreTrainedConfig):
         # Check that the horizon size and U-Net downsampling is compatible.
         # U-Net downsamples by 2 with each stage.
         downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
+        if self.denoiser_type == "unet" and self.horizon % downsampling_factor != 0:
             raise ValueError(
                 "The horizon should be an integer multiple of the downsampling factor (which is determined "
                 f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
